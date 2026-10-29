@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -31,12 +32,15 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Redo
 import androidx.compose.material.icons.automirrored.filled.Undo
+import androidx.compose.material.icons.automirrored.filled.FormatListBulleted
+import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.Straighten
+import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material.icons.outlined.Gesture
 import androidx.compose.material3.AlertDialog
@@ -144,11 +148,17 @@ fun EditorScreen(id: String, isNew: Boolean, repo: NoteRepository, prefs: Prefs,
     var customColors by remember { mutableStateOf(prefs.customColors) }
     var confirmDeletePage by remember { mutableStateOf(false) }
     var penSeen by remember { mutableStateOf(false) }
+    var textEditing by remember { mutableStateOf(false) }
+    var textColor by remember { mutableIntStateOf(prefs.textColor) }
+    var textSize by remember { mutableFloatStateOf(prefs.textSize) }
+    var busy by remember { mutableStateOf<String?>(null) }
 
     var saveJob by remember { mutableStateOf<Job?>(null) }
 
     val view = remember {
         InkView(ctx).apply {
+            this.textColor = prefs.textColor
+            this.textSize = prefs.textSize
             this.penTool = penTool
             for (t in 0 until Stroke.TOOL_COUNT) { this.colors[t] = colors[t]; this.widths[t] = widths[t] }
             eraserWholeStroke = eraserWhole
@@ -158,6 +168,24 @@ fun EditorScreen(id: String, isNew: Boolean, repo: NoteRepository, prefs: Prefs,
             holdToStraighten = prefs.holdToStraighten
         }
     }
+    val canvasLayout = remember { NoteCanvasLayout(ctx, view) }
+
+    // The attached PDF (for notes made from a PDF), rendered under the ink.
+    DisposableEffect(doc) {
+        val d = doc
+        var pdf: com.ski.notes.data.PdfPages? = null
+        if (d != null && d.hasPdf) {
+            pdf = runCatching { com.ski.notes.data.PdfPages(repo.pdfFile(d.id)) }.getOrNull()
+            view.pdf = pdf
+        }
+        onDispose {
+            view.pdf = null
+            pdf?.close()
+        }
+    }
+
+    // Back while typing just finishes typing.
+    androidx.activity.compose.BackHandler(enabled = textEditing) { view.commitText() }
 
     fun saveSoon() {
         saveJob?.cancel()
@@ -168,6 +196,7 @@ fun EditorScreen(id: String, isNew: Boolean, repo: NoteRepository, prefs: Prefs,
     }
 
     fun close() {
+        view.commitText()
         saveJob?.cancel()
         doc?.let { repo.saveAsync(it, deleteIfEmpty = isNew) }
         onClose()
@@ -186,6 +215,7 @@ fun EditorScreen(id: String, isNew: Boolean, repo: NoteRepository, prefs: Prefs,
             override fun onSelectionChanged(count: Int) { selCount = count }
             override fun onPageChanged(current: Int, total: Int) { page = current; pages = total }
             override fun onStylusSeen() { penSeen = true }
+            override fun onTextEditing(active: Boolean) { textEditing = active }
         }
         view.setDocument(d)
     }
@@ -194,7 +224,7 @@ fun EditorScreen(id: String, isNew: Boolean, repo: NoteRepository, prefs: Prefs,
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     DisposableEffect(lifecycle) {
         val obs = LifecycleEventObserver { _, e ->
-            if (e == Lifecycle.Event.ON_PAUSE) { saveJob?.cancel(); doc?.let { repo.saveAsync(it) } }
+            if (e == Lifecycle.Event.ON_PAUSE) { view.commitText(); saveJob?.cancel(); doc?.let { repo.saveAsync(it) } }
         }
         lifecycle.addObserver(obs)
         onDispose { lifecycle.removeObserver(obs) }
@@ -208,6 +238,39 @@ fun EditorScreen(id: String, isNew: Boolean, repo: NoteRepository, prefs: Prefs,
         view.penTool = t
         prefs.penTool = t
         showOptions = false
+    }
+
+    fun setTextColor(c: Int) {
+        textColor = c
+        prefs.textColor = c
+        view.setTextColorForEdit(c)
+    }
+
+    fun setTextSizeTo(sz: Float) {
+        textSize = sz
+        prefs.textSize = sz
+        view.setTextSizeForEdit(sz)
+    }
+
+    fun export(label: String, mime: String, open: Boolean = false, make: (NoteDoc) -> java.io.File) {
+        view.commitText()
+        val d = doc ?: return
+        val snap = repo.snapshot(d)
+        busy = label
+        scope.launch {
+            val r = withContext(Dispatchers.IO) { runCatching { make(snap) } }
+            busy = null
+            val f = r.getOrNull()
+            if (f == null) {
+                Toast.makeText(ctx, "Couldn't create the file: ${r.exceptionOrNull()?.message ?: "unknown error"}", Toast.LENGTH_LONG).show()
+                return@launch
+            }
+            try {
+                if (open) Exporter.openWith(ctx, f, mime) else Exporter.share(ctx, f, mime)
+            } catch (_: Throwable) {
+                Toast.makeText(ctx, "No app found to open it", Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     fun setColor(c: Int) {
@@ -258,22 +321,27 @@ fun EditorScreen(id: String, isNew: Boolean, repo: NoteRepository, prefs: Prefs,
                             HorizontalDivider()
                             DropdownMenuItem(text = { Text("Share as PDF") }, onClick = {
                                 showMenu = false
-                                val d = doc ?: return@DropdownMenuItem
-                                val snap = repo.snapshot(d)
-                                scope.launch {
-                                    val f = withContext(Dispatchers.IO) { runCatching { Exporter.pdf(ctx, snap) }.getOrNull() }
-                                    if (f != null) Exporter.share(ctx, f, "application/pdf")
-                                    else Toast.makeText(ctx, "Couldn't create the PDF", Toast.LENGTH_SHORT).show()
-                                }
+                                export("Making PDF…", "application/pdf") { Exporter.pdf(ctx, it, repo.pdfFile(it.id)) }
+                            })
+                            DropdownMenuItem(text = { Text("Share as Word (.docx)") }, onClick = {
+                                showMenu = false
+                                export("Making Word file…", "application/vnd.openxmlformats-officedocument.wordprocessingml.document") { Exporter.docx(ctx, it) }
+                            })
+                            DropdownMenuItem(text = { Text("Open in Word / other app") }, onClick = {
+                                showMenu = false
+                                export("Making Word file…", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", open = true) { Exporter.docx(ctx, it) }
                             })
                             DropdownMenuItem(text = { Text("Share this page as image") }, onClick = {
                                 showMenu = false
-                                val d = doc ?: return@DropdownMenuItem
-                                val snap = repo.snapshot(d)
-                                val p = view.currentPage().coerceAtMost(snap.pages.size - 1)
-                                scope.launch {
-                                    val f = withContext(Dispatchers.IO) { runCatching { Exporter.pagePng(ctx, snap, p) }.getOrNull() }
-                                    if (f != null) Exporter.share(ctx, f, "image/png")
+                                val p = view.currentPage()
+                                export("Making image…", "image/png") { snap ->
+                                    val idx = p.coerceAtMost(snap.pages.size - 1)
+                                    val pg = snap.pages[idx]
+                                    val bg = if (pg.pdfPage >= 0 && snap.hasPdf) {
+                                        val pp = com.ski.notes.data.PdfPages(repo.pdfFile(snap.id))
+                                        try { pp.renderBlocking(pg.pdfPage, 1654) } finally { pp.close() }
+                                    } else null
+                                    Exporter.pagePng(ctx, snap, idx, bg)
                                 }
                             })
                             HorizontalDivider()
@@ -289,7 +357,7 @@ fun EditorScreen(id: String, isNew: Boolean, repo: NoteRepository, prefs: Prefs,
                     if (loadFailed) Text("This note couldn't be opened.", color = TextDim, modifier = Modifier.align(Alignment.Center))
                     else CircularProgressIndicator(Modifier.align(Alignment.Center))
                 } else {
-                    AndroidView(factory = { view }, modifier = Modifier.fillMaxSize())
+                    AndroidView(factory = { canvasLayout }, modifier = Modifier.fillMaxSize())
                 }
 
                 // selection actions
@@ -306,7 +374,17 @@ fun EditorScreen(id: String, isNew: Boolean, repo: NoteRepository, prefs: Prefs,
                 }
 
                 // "S Pen only" hint the first time a finger is the only input
-                if (!penSeen && !fingerDraws && doc != null && canUndo.not()) {
+                busy?.let { msg ->
+                    Surface(color = PanelHigh, shape = RoundedCornerShape(14.dp), shadowElevation = 6.dp, modifier = Modifier.align(Alignment.Center)) {
+                        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                            CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.5.dp)
+                            Spacer(Modifier.width(12.dp))
+                            Text(msg)
+                        }
+                    }
+                }
+
+                if (!penSeen && !fingerDraws && doc != null && canUndo.not() && mode != InkView.Mode.TEXT) {
                     Surface(
                         color = PanelHigh, shape = RoundedCornerShape(14.dp),
                         modifier = Modifier.align(Alignment.BottomCenter).padding(12.dp).widthIn(max = 420.dp),
@@ -336,6 +414,12 @@ fun EditorScreen(id: String, isNew: Boolean, repo: NoteRepository, prefs: Prefs,
                                     Text("Size", color = TextDim, fontSize = 12.sp)
                                     Slider(eraserSize, { eraserSize = it; view.eraserSizeDp = it; prefs.eraserSize = it }, valueRange = 4f..60f)
                                 }
+                                InkView.Mode.TEXT -> {
+                                    Text("Text", fontWeight = FontWeight.SemiBold)
+                                    Text("Tap anywhere on the page to type. Tap text to edit it.", color = TextDim, fontSize = 13.sp)
+                                    Spacer(Modifier.height(8.dp))
+                                    TextSizeChips(textSize) { setTextSizeTo(it) }
+                                }
                                 InkView.Mode.LASSO -> {
                                     Text("Lasso", fontWeight = FontWeight.SemiBold)
                                     Text("Circle strokes to select them. Drag the selection to move it, drag the corner dot to resize.", color = TextDim, fontSize = 13.sp)
@@ -358,8 +442,17 @@ fun EditorScreen(id: String, isNew: Boolean, repo: NoteRepository, prefs: Prefs,
 
             // ---------------- bottom toolbar
             Surface(color = Panel) {
-                Column(Modifier.fillMaxWidth().navigationBarsPadding()) {
-                    Row(
+                Column(Modifier.fillMaxWidth().navigationBarsPadding().imePadding()) {
+                    if (textEditing) {
+                        TextFormatBar(
+                            size = textSize,
+                            onFlag = { view.toggleTextFlag(it) },
+                            onBullets = { view.toggleBullets() },
+                            onSize = { setTextSizeTo(it) },
+                            onDelete = { view.deleteEditingText() },
+                            onDone = { view.commitText() },
+                        )
+                    } else Row(
                         Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 2.dp),
                         verticalAlignment = Alignment.Bottom,
                         horizontalArrangement = Arrangement.Center,
@@ -376,6 +469,10 @@ fun EditorScreen(id: String, isNew: Boolean, repo: NoteRepository, prefs: Prefs,
                             EraserGlyph(selected = mode == InkView.Mode.ERASER)
                         }
                         Spacer(Modifier.width(6.dp))
+                        ToolIcon(selected = mode == InkView.Mode.TEXT, onClick = {
+                            if (mode == InkView.Mode.TEXT) showOptions = !showOptions
+                            else { mode = InkView.Mode.TEXT; view.mode = InkView.Mode.TEXT; showOptions = false }
+                        }) { Icon(Icons.Default.TextFields, "Type text") }
                         ToolIcon(selected = mode == InkView.Mode.LASSO, onClick = {
                             if (mode == InkView.Mode.LASSO) showOptions = !showOptions
                             else { mode = InkView.Mode.LASSO; view.mode = InkView.Mode.LASSO; showOptions = false }
@@ -390,18 +487,21 @@ fun EditorScreen(id: String, isNew: Boolean, repo: NoteRepository, prefs: Prefs,
                     }
                     HorizontalDivider(color = Line)
                     // colours for the current pen
-                    val palette = if (penTool == Stroke.HIGHLIGHTER) HighlighterColors else PresetColors
+                    val forText = mode == InkView.Mode.TEXT || textEditing
+                    val palette = if (!forText && penTool == Stroke.HIGHLIGHTER) HighlighterColors else PresetColors
                     Row(
                         Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 8.dp),
                         horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        val current = colors[penTool]
+                        val current = if (forText) textColor else colors[penTool]
                         for (c in palette + customColors) {
-                            Swatch(Color(c), selected = mode == InkView.Mode.PEN && current == c) { setColor(c) }
+                            Swatch(Color(c), selected = (forText || mode == InkView.Mode.PEN) && current == c) {
+                                if (forText) setTextColor(c) else setColor(c)
+                            }
                         }
                         Box(
-                            Modifier.size(30.dp).clip(CircleShape).background(PanelHigh).clickable { pickColorFor = penTool },
+                            Modifier.size(30.dp).clip(CircleShape).background(PanelHigh).clickable { pickColorFor = if (forText) -2 else penTool },
                             contentAlignment = Alignment.Center,
                         ) { Icon(Icons.Default.Add, "Custom colour", modifier = Modifier.size(18.dp)) }
                     }
@@ -412,12 +512,18 @@ fun EditorScreen(id: String, isNew: Boolean, repo: NoteRepository, prefs: Prefs,
 
     pickColorFor?.let { target ->
         ColorPickerDialog(
-            initial = if (target >= 0) colors[target] else android.graphics.Color.BLACK,
+            initial = if (target >= 0) colors[target] else if (target == -2) textColor else android.graphics.Color.BLACK,
             onDismiss = { pickColorFor = null },
             onPick = { c ->
                 pickColorFor = null
-                if (target < 0) view.recolorSelection(c)
-                else {
+                if (target == -1) view.recolorSelection(c)
+                else if (target == -2) {
+                    setTextColor(c)
+                    if (c !in PresetColors && c !in customColors) {
+                        customColors = (listOf(c) + customColors).take(8)
+                        prefs.customColors = customColors
+                    }
+                } else {
                     setColor(c)
                     if (c !in PresetColors && c !in HighlighterColors && c !in customColors) {
                         customColors = (listOf(c) + customColors).take(8)
@@ -503,5 +609,78 @@ private fun StrokePreview(tool: Int, color: Color, width: Float) {
             s.add(x, y, p)
         }
         PageRenderer.drawStroke(drawContext.canvas.nativeCanvas, s, NoteDoc.TONE_WHITE, PageRenderer.buildPath(s))
+    }
+}
+
+private val textSizes = listOf("Small" to 26f, "Normal" to 36f, "Large" to 52f, "Heading" to 72f)
+
+@Composable
+private fun TextSizeChips(current: Float, onPick: (Float) -> Unit) {
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        for ((name, sz) in textSizes) FilterChip(current == sz, { onPick(sz) }, label = { Text(name) })
+    }
+}
+
+/** Shown while typing: formatting for the selection (or the word at the cursor). */
+@Composable
+private fun TextFormatBar(
+    size: Float,
+    onFlag: (Int) -> Unit,
+    onBullets: () -> Unit,
+    onSize: (Float) -> Unit,
+    onDelete: () -> Unit,
+    onDone: () -> Unit,
+) {
+    var sizeMenu by remember { mutableStateOf(false) }
+    Row(
+        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 6.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        FormatButton("B", FontWeight.Bold) { onFlag(com.ski.notes.engine.TextBox.BOLD) }
+        FormatButton("I", italic = true) { onFlag(com.ski.notes.engine.TextBox.ITALIC) }
+        FormatButton("U", underline = true) { onFlag(com.ski.notes.engine.TextBox.UNDERLINE) }
+        FormatButton("S", strike = true) { onFlag(com.ski.notes.engine.TextBox.STRIKE) }
+        IconButton(onClick = onBullets) { Icon(Icons.AutoMirrored.Filled.FormatListBulleted, "Bullets") }
+        Box {
+            TextButton(onClick = { sizeMenu = true }) {
+                Text(textSizes.firstOrNull { it.second == size }?.first ?: "${size.toInt()}")
+                Icon(Icons.Default.ArrowDropDown, null)
+            }
+            DropdownMenu(expanded = sizeMenu, onDismissRequest = { sizeMenu = false }) {
+                for ((name, sz) in textSizes) {
+                    DropdownMenuItem(text = { Text(name, fontSize = (12 + sz / 6).sp) }, onClick = { sizeMenu = false; onSize(sz) })
+                }
+            }
+        }
+        IconButton(onClick = onDelete) { Icon(Icons.Default.Delete, "Delete text box") }
+        Spacer(Modifier.width(4.dp))
+        TextButton(onClick = onDone) { Text("Done") }
+    }
+}
+
+@Composable
+private fun FormatButton(
+    label: String,
+    weight: FontWeight = FontWeight.Normal,
+    italic: Boolean = false,
+    underline: Boolean = false,
+    strike: Boolean = false,
+    onClick: () -> Unit,
+) {
+    Box(
+        Modifier.size(42.dp).clip(RoundedCornerShape(10.dp)).clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            label,
+            fontSize = 18.sp,
+            fontWeight = if (label == "B") FontWeight.Bold else weight,
+            fontStyle = if (italic) androidx.compose.ui.text.font.FontStyle.Italic else androidx.compose.ui.text.font.FontStyle.Normal,
+            textDecoration = when {
+                underline -> androidx.compose.ui.text.style.TextDecoration.Underline
+                strike -> androidx.compose.ui.text.style.TextDecoration.LineThrough
+                else -> null
+            },
+        )
     }
 }

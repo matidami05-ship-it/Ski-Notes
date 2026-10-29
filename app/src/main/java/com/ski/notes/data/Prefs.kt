@@ -38,6 +38,14 @@ class Prefs(context: Context) {
     fun width(tool: Int, def: Float): Float = sp.getFloat("width$tool", def)
     fun setWidth(tool: Int, w: Float) = sp.edit().putFloat("width$tool", w).apply()
 
+    var textSize: Float
+        get() = sp.getFloat("textSize", 36f)
+        set(v) = sp.edit().putFloat("textSize", v).apply()
+
+    var textColor: Int
+        get() = sp.getInt("textColor", 0xFF000000.toInt())
+        set(v) = sp.edit().putInt("textColor", v).apply()
+
     var defaultPaper: Int
         get() = sp.getInt("paper", NoteDoc.PAPER_LINED)
         set(v) = sp.edit().putInt("paper", v).apply()

@@ -6,8 +6,9 @@ import java.util.Arrays;
 import java.util.List;
 
 /**
- * Undo / redo. Every change is "on page P, remove these strokes and add those", which covers drawing,
- * erasing, cutting, moving, recolouring and deleting.
+ * Undo / redo. Every change is "on page P, remove these strokes and add those" plus, optionally, "the
+ * page's typed text went from list A to list B". That covers drawing, erasing, moving, recolouring,
+ * typing and deleting.
  */
 public final class History {
     public static final class Edit {
@@ -15,12 +16,16 @@ public final class History {
         final int[] removedIdx; // ascending, indices before the edit
         final Stroke[] removed;
         final Stroke[] added;
+        final TextBox[] textsBefore; // null = text not touched
+        final TextBox[] textsAfter;
 
-        Edit(int page, int[] removedIdx, Stroke[] removed, Stroke[] added) {
+        Edit(int page, int[] removedIdx, Stroke[] removed, Stroke[] added, TextBox[] textsBefore, TextBox[] textsAfter) {
             this.page = page;
             this.removedIdx = removedIdx;
             this.removed = removed;
             this.added = added;
+            this.textsBefore = textsBefore;
+            this.textsAfter = textsAfter;
         }
     }
 
@@ -44,6 +49,11 @@ public final class History {
 
     /** Applies and records: remove strokes at the given indices of a page, then append the added strokes. */
     public void apply(int page, List<Integer> removeIndices, List<Stroke> added) {
+        apply(page, removeIndices, added, null);
+    }
+
+    /** As above, and also replaces the page's typed text with {@code textsAfter} (null = leave text alone). */
+    public void apply(int page, List<Integer> removeIndices, List<Stroke> added, List<TextBox> textsAfter) {
         List<Stroke> strokes = doc.pages.get(page).strokes;
         int[] idx = new int[removeIndices == null ? 0 : removeIndices.size()];
         for (int i = 0; i < idx.length; i++) idx[i] = removeIndices.get(i);
@@ -51,12 +61,23 @@ public final class History {
         Stroke[] removed = new Stroke[idx.length];
         for (int i = 0; i < idx.length; i++) removed[i] = strokes.get(idx[i]);
         Stroke[] add = added == null ? new Stroke[0] : added.toArray(new Stroke[0]);
-        if (removed.length == 0 && add.length == 0) return;
-        Edit e = new Edit(page, idx, removed, add);
+        TextBox[] before = null, after = null;
+        if (textsAfter != null) {
+            before = doc.pages.get(page).texts.toArray(new TextBox[0]);
+            after = textsAfter.toArray(new TextBox[0]);
+            if (Arrays.equals(before, after)) before = after = null;
+        }
+        if (removed.length == 0 && add.length == 0 && after == null) return;
+        Edit e = new Edit(page, idx, removed, add, before, after);
         doForward(e);
         undo.push(e);
         while (undo.size() > limit) undo.removeLast();
         redo.clear();
+    }
+
+    /** Replaces a page's typed text (one undo step). */
+    public void setTexts(int page, List<TextBox> after) {
+        apply(page, null, null, after);
     }
 
     /** Convenience for a single new stroke. */
@@ -89,14 +110,24 @@ public final class History {
     }
 
     private void doForward(Edit e) {
-        List<Stroke> strokes = doc.pages.get(e.page).strokes;
+        NoteDoc.Page pg = doc.pages.get(e.page);
+        List<Stroke> strokes = pg.strokes;
         for (int i = e.removedIdx.length - 1; i >= 0; i--) strokes.remove(e.removedIdx[i]);
         strokes.addAll(Arrays.asList(e.added));
+        if (e.textsAfter != null) {
+            pg.texts.clear();
+            pg.texts.addAll(Arrays.asList(e.textsAfter));
+        }
     }
 
     private void doBackward(Edit e) {
-        List<Stroke> strokes = doc.pages.get(e.page).strokes;
+        NoteDoc.Page pg = doc.pages.get(e.page);
+        List<Stroke> strokes = pg.strokes;
         for (int i = 0; i < e.added.length; i++) strokes.remove(strokes.size() - 1);
         for (int i = 0; i < e.removedIdx.length; i++) strokes.add(e.removedIdx[i], e.removed[i]);
+        if (e.textsBefore != null) {
+            pg.texts.clear();
+            pg.texts.addAll(Arrays.asList(e.textsBefore));
+        }
     }
 }

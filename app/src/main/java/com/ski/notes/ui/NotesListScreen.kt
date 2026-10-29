@@ -19,12 +19,14 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.FileOpen
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.outlined.Draw
@@ -73,7 +75,11 @@ fun NotesListScreen(
     version: Int,
     onOpen: (String) -> Unit,
     onNew: () -> Unit,
+    onImport: (android.net.Uri, String?) -> Unit,
 ) {
+    val importer = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
+    ) { uri -> if (uri != null) onImport(uri, null) }
     var items by remember { mutableStateOf<List<NoteRepository.Item>?>(null) }
     var refresh by remember { mutableStateOf(0) }
     var query by remember { mutableStateOf("") }
@@ -100,6 +106,13 @@ fun NotesListScreen(
         Column(Modifier.fillMaxSize().padding(bottom = pad.calculateBottomPadding()).statusBarsPadding()) {
             Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp, top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text("Ski Notes", fontSize = 30.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                androidx.compose.material3.TextButton(onClick = {
+                    importer.launch(arrayOf("application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"))
+                }) {
+                    Icon(Icons.Default.FileOpen, null)
+                    Spacer(Modifier.width(6.dp))
+                    Text("Open PDF / Word")
+                }
                 IconButton(onClick = { showSettings = true }) { Icon(Icons.Default.Settings, "S Pen settings") }
             }
             OutlinedTextField(
@@ -112,7 +125,10 @@ fun NotesListScreen(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
             )
             val list = items
-            val shown = list?.filter { query.isBlank() || it.title.contains(query.trim(), ignoreCase = true) }
+            val shown = list?.filter {
+                val q = query.trim()
+                q.isEmpty() || it.title.contains(q, ignoreCase = true) || it.text.contains(q, ignoreCase = true)
+            }
             if (list != null && list.isEmpty()) {
                 EmptyState(Modifier.weight(1f).fillMaxWidth())
             } else {
@@ -234,7 +250,7 @@ private fun NoteCard(
             modifier = Modifier.fillMaxWidth(),
         )
         Text(
-            DateUtils.getRelativeTimeSpanString(item.modified).toString() + " · ${item.pages} page" + if (item.pages == 1) "" else "s",
+            (if (item.hasPdf) "PDF · " else "") + DateUtils.getRelativeTimeSpanString(item.modified).toString() + " · ${item.pages} page" + if (item.pages == 1) "" else "s",
             color = TextDim,
             fontSize = 12.sp,
             maxLines = 1,

@@ -6,9 +6,11 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.RectF
 import com.ski.notes.engine.NoteDoc
 import com.ski.notes.engine.Outline
 import com.ski.notes.engine.Stroke
+import com.ski.notes.engine.TextBox
 import java.util.WeakHashMap
 
 /** Draws paper and strokes. Shared by the editor, thumbnails and PDF export (synchronized: the save thread renders thumbnails). */
@@ -44,10 +46,15 @@ object PageRenderer {
         return if (lum < 0.18) Color.argb(Color.alpha(color), 236, 238, 242) else color
     }
 
+    /** Undoes [displayColor] for a colour read back from the screen (typed text on dark paper). */
+    fun storedColor(shown: Int, tone: Int): Int {
+        if (tone != NoteDoc.TONE_DARK) return shown
+        return if (Color.red(shown) == 236 && Color.green(shown) == 238 && Color.blue(shown) == 242) Color.argb(Color.alpha(shown), 0, 0, 0) else shown
+    }
+
     @Synchronized
-    fun drawPaper(c: Canvas, paper: Int, tone: Int) {
+    fun drawPaper(c: Canvas, paper: Int, tone: Int, h: Float = NoteDoc.PAGE_H) {
         val w = NoteDoc.PAGE_W
-        val h = NoteDoc.PAGE_H
         paperPaint.color = paperColor(tone)
         c.drawRect(0f, 0f, w, h, paperPaint)
         patternPaint.color = patternColor(tone)
@@ -133,29 +140,93 @@ object PageRenderer {
         }
     }
 
-    /** Draws one page (paper + ink) in page coordinates. */
+    private val bgPaint = Paint(Paint.FILTER_BITMAP_FLAG)
+    private val pdfWhite = Paint().apply { color = Color.WHITE }
+    private val dst = RectF()
+
+    /**
+     * Draws one page in page coordinates: paper (or the PDF page underneath), typed text, then ink on top.
+     * [pdfBg] is the rendered PDF page for pages that have one (null = not ready yet, drawn white).
+     */
     @Synchronized
-    fun drawPage(c: Canvas, doc: NoteDoc, strokes: List<Stroke>, skip: Set<Stroke>? = null) {
-        drawPaper(c, doc.paper, doc.tone)
+    fun drawPage(
+        c: Canvas,
+        doc: NoteDoc,
+        page: NoteDoc.Page,
+        strokes: List<Stroke> = page.strokes,
+        skip: Set<Stroke>? = null,
+        skipText: TextBox? = null,
+        pdfBg: Bitmap? = null,
+    ) {
+        val h = page.height
+        if (page.pdfPage >= 0) {
+            c.drawRect(0f, 0f, NoteDoc.PAGE_W, h, pdfWhite)
+            if (pdfBg != null) {
+                dst.set(0f, 0f, NoteDoc.PAGE_W, h)
+                c.drawBitmap(pdfBg, null, dst, bgPaint)
+            }
+        } else drawPaper(c, doc.paper, doc.tone, h)
         c.save()
-        c.clipRect(0f, 0f, NoteDoc.PAGE_W, NoteDoc.PAGE_H)
+        c.clipRect(0f, 0f, NoteDoc.PAGE_W, h)
+        val tone = if (page.pdfPage >= 0) NoteDoc.TONE_WHITE else doc.tone
+        for (t in page.texts) {
+            if (t === skipText) continue
+            drawText(c, t, tone)
+        }
         for (s in strokes) {
             if (skip != null && s in skip) continue
-            val h = s.maxHalfWidth() + 2f
-            if (c.quickReject(s.minX - h, s.minY - h, s.maxX + h, s.maxY + h)) continue
-            drawStroke(c, s, doc.tone)
+            val sh = s.maxHalfWidth() + 2f
+            if (c.quickReject(s.minX - sh, s.minY - sh, s.maxX + sh, s.maxY + sh)) continue
+            drawStroke(c, s, tone)
         }
         c.restore()
     }
 
+    fun drawText(c: Canvas, t: TextBox, tone: Int) {
+        val l = TextStyler.layout(t, tone)
+        if (c.quickReject(t.x, t.y, t.x + t.w, t.y + l.height)) return
+        c.save()
+        c.translate(t.x, t.y)
+        l.draw(c)
+        c.restore()
+    }
+
+    /** Ink colours shown on a page: PDF pages are always light, so ink is never flipped there. */
+    fun pageTone(doc: NoteDoc, page: NoteDoc.Page): Int = if (page.pdfPage >= 0) NoteDoc.TONE_WHITE else doc.tone
+
     /** Renders a page to a bitmap of the given width (thumbnails, sharing). */
     @Synchronized
-    fun renderPage(doc: NoteDoc, index: Int, width: Int): Bitmap {
+    fun renderPage(doc: NoteDoc, index: Int, width: Int, pdfBg: Bitmap? = null): Bitmap {
         val scale = width / NoteDoc.PAGE_W
-        val bmp = Bitmap.createBitmap(width, (NoteDoc.PAGE_H * scale).toInt().coerceAtLeast(1), Bitmap.Config.ARGB_8888)
+        val page = doc.pages[index]
+        val bmp = Bitmap.createBitmap(width, (page.height * scale).toInt().coerceAtLeast(1), Bitmap.Config.ARGB_8888)
         val c = Canvas(bmp)
         c.scale(scale, scale)
-        drawPage(c, doc, doc.pages[index].strokes)
+        drawPage(c, doc, page, pdfBg = pdfBg)
+        return bmp
+    }
+
+    /** Only the handwriting of a page, on white (for Word export). Returns null if the page has no ink. */
+    @Synchronized
+    fun renderInk(doc: NoteDoc, index: Int, width: Int): Bitmap? {
+        val page = doc.pages[index]
+        if (page.strokes.isEmpty()) return null
+        var minX = Float.MAX_VALUE; var minY = Float.MAX_VALUE; var maxX = -Float.MAX_VALUE; var maxY = -Float.MAX_VALUE
+        for (s in page.strokes) {
+            val hw = s.maxHalfWidth()
+            minX = minOf(minX, s.minX - hw); minY = minOf(minY, s.minY - hw)
+            maxX = maxOf(maxX, s.maxX + hw); maxY = maxOf(maxY, s.maxY + hw)
+        }
+        minX = minX.coerceAtLeast(0f) ; minY = minY.coerceAtLeast(0f)
+        maxX = maxX.coerceAtMost(NoteDoc.PAGE_W); maxY = maxY.coerceAtMost(page.height)
+        if (maxX - minX < 2 || maxY - minY < 2) return null
+        val scale = width / NoteDoc.PAGE_W
+        val bmp = Bitmap.createBitmap(((maxX - minX) * scale).toInt().coerceAtLeast(1), ((maxY - minY) * scale).toInt().coerceAtLeast(1), Bitmap.Config.ARGB_8888)
+        bmp.eraseColor(Color.WHITE)
+        val c = Canvas(bmp)
+        c.scale(scale, scale)
+        c.translate(-minX, -minY)
+        for (s in page.strokes) drawStroke(c, s, NoteDoc.TONE_WHITE)
         return bmp
     }
 

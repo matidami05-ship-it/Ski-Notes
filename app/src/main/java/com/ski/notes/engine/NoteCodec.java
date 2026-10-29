@@ -7,11 +7,15 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 
-/** Compact binary file format for notes (.skn). */
+/**
+ * Compact binary file format for notes (.skn).
+ * v1: strokes only. v2: adds typed text, page heights, PDF backgrounds and a search excerpt in the header.
+ */
 public final class NoteCodec {
     private static final int MAGIC = 0x534B4E54; // "SKNT"
-    private static final int VERSION = 1;
+    private static final int VERSION = 2;
 
     private NoteCodec() {
     }
@@ -25,6 +29,9 @@ public final class NoteCodec {
         public int paper;
         public int tone;
         public int pageCount;
+        public boolean hasPdf;
+        public String text = "";
+        int version;
     }
 
     public static void write(NoteDoc d, OutputStream os) throws IOException {
@@ -38,7 +45,12 @@ public final class NoteCodec {
         out.writeByte(d.paper);
         out.writeByte(d.tone);
         out.writeInt(d.pages.size());
+        // v2 header extras
+        out.writeBoolean(d.hasPdf);
+        writeString(out, d.allText(4000));
         for (NoteDoc.Page pg : d.pages) {
+            out.writeFloat(pg.height);
+            out.writeInt(pg.pdfPage);
             out.writeInt(pg.strokes.size());
             for (Stroke s : pg.strokes) {
                 out.writeByte(s.tool);
@@ -51,8 +63,39 @@ public final class NoteCodec {
                     out.writeFloat(s.p[i]);
                 }
             }
+            out.writeInt(pg.texts.size());
+            for (TextBox t : pg.texts) {
+                out.writeFloat(t.x);
+                out.writeFloat(t.y);
+                out.writeFloat(t.w);
+                out.writeFloat(t.size);
+                out.writeInt(t.color);
+                writeString(out, t.text);
+                out.writeInt(t.runs.length);
+                for (TextBox.Run r : t.runs) {
+                    out.writeInt(r.start);
+                    out.writeInt(r.end);
+                    out.writeInt(r.flags);
+                    out.writeInt(r.color);
+                    out.writeFloat(r.scale);
+                }
+            }
         }
         out.flush();
+    }
+
+    private static void writeString(DataOutputStream out, String s) throws IOException {
+        byte[] b = s.getBytes(StandardCharsets.UTF_8);
+        out.writeInt(b.length);
+        out.write(b);
+    }
+
+    private static String readString(DataInputStream in) throws IOException {
+        int n = in.readInt();
+        if (n < 0 || n > 50_000_000) throw new IOException("Damaged file");
+        byte[] b = new byte[n];
+        in.readFully(b);
+        return new String(b, StandardCharsets.UTF_8);
     }
 
     private static DataInputStream open(InputStream is) {
@@ -64,6 +107,7 @@ public final class NoteCodec {
         int v = in.readInt();
         if (v > VERSION) throw new IOException("Made by a newer version of Ski Notes");
         Meta m = new Meta();
+        m.version = v;
         m.id = in.readUTF();
         m.title = in.readUTF();
         m.created = in.readLong();
@@ -72,6 +116,10 @@ public final class NoteCodec {
         m.tone = in.readUnsignedByte();
         m.pageCount = in.readInt();
         if (m.pageCount < 0 || m.pageCount > 100_000) throw new IOException("Damaged file");
+        if (v >= 2) {
+            m.hasPdf = in.readBoolean();
+            m.text = readString(in);
+        }
         return m;
     }
 
@@ -88,8 +136,14 @@ public final class NoteCodec {
         d.modified = m.modified;
         d.paper = Math.min(m.paper, NoteDoc.PAPER_COUNT - 1);
         d.tone = Math.min(m.tone, NoteDoc.TONE_COUNT - 1);
+        d.hasPdf = m.hasPdf;
         for (int pi = 0; pi < m.pageCount; pi++) {
             NoteDoc.Page pg = new NoteDoc.Page();
+            if (m.version >= 2) {
+                float h = in.readFloat();
+                pg.height = (h > 10f && h < 100_000f) ? h : NoteDoc.PAGE_H;
+                pg.pdfPage = in.readInt();
+            }
             int sc = in.readInt();
             if (sc < 0 || sc > 10_000_000) throw new IOException("Damaged file");
             for (int si = 0; si < sc; si++) {
@@ -106,6 +160,24 @@ public final class NoteCodec {
                     s.add(x, y, p);
                 }
                 pg.strokes.add(s);
+            }
+            if (m.version >= 2) {
+                int tc = in.readInt();
+                if (tc < 0 || tc > 1_000_000) throw new IOException("Damaged file");
+                for (int ti = 0; ti < tc; ti++) {
+                    float x = in.readFloat(), y = in.readFloat(), w = in.readFloat(), size = in.readFloat();
+                    int color = in.readInt();
+                    String text = readString(in);
+                    int rc = in.readInt();
+                    if (rc < 0 || rc > 1_000_000) throw new IOException("Damaged file");
+                    TextBox.Run[] runs = new TextBox.Run[rc];
+                    for (int r = 0; r < rc; r++) {
+                        int st = in.readInt(), en = in.readInt(), fl = in.readInt(), co = in.readInt();
+                        float sc2 = in.readFloat();
+                        runs[r] = new TextBox.Run(st, en, fl, co, sc2);
+                    }
+                    pg.texts.add(new TextBox(x, y, w, size, color, text, runs));
+                }
             }
             d.pages.add(pg);
         }

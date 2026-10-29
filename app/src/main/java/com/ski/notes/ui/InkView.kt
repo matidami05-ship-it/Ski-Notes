@@ -27,6 +27,7 @@ import com.ski.notes.engine.NoteDoc
 import com.ski.notes.engine.Outline
 import com.ski.notes.engine.Ruler
 import com.ski.notes.engine.Stroke
+import com.ski.notes.engine.TextBox
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.floor
@@ -52,9 +53,10 @@ class InkView(context: Context) : View(context) {
         fun onSelectionChanged(count: Int)
         fun onPageChanged(current: Int, total: Int)
         fun onStylusSeen()
+        fun onTextEditing(active: Boolean)
     }
 
-    enum class Mode { PEN, ERASER, LASSO }
+    enum class Mode { PEN, ERASER, LASSO, TEXT }
     enum class SideAction { ERASER, LASSO, HIGHLIGHTER, NONE }
 
     var listener: Listener? = null
@@ -70,7 +72,9 @@ class InkView(context: Context) : View(context) {
         doc = d
         if (doc.pages.isEmpty()) doc.pages.add(NoteDoc.Page())
         history = History(d, 300)
+        cancelTextEdit()
         selection = null
+        pagesChanged()
         fitted = false
         if (width > 0) fitToWidth()
         sceneDirty()
@@ -81,7 +85,12 @@ class InkView(context: Context) : View(context) {
     // ---------------------------------------------------------------- tool settings (set by the UI)
 
     var mode = Mode.PEN
-        set(v) { field = v; if (v != Mode.LASSO) clearSelection(); invalidate() }
+        set(v) {
+            if (field == Mode.TEXT && v != Mode.TEXT) commitText()
+            field = v
+            if (v != Mode.LASSO) clearSelection()
+            invalidate()
+        }
     var penTool = Stroke.FOUNTAIN
     val colors = IntArray(Stroke.TOOL_COUNT) { Color.BLACK }.also { it[Stroke.HIGHLIGHTER] = 0xFFFFE04A.toInt() }
     /** Base widths in page units. */
@@ -111,19 +120,49 @@ class InkView(context: Context) : View(context) {
     private var fitted = false
     private val viewMatrix = Matrix()
 
-    private fun pageTop(i: Int) = i * (NoteDoc.PAGE_H + gap)
-    private fun docHeight() = doc.pages.size * (NoteDoc.PAGE_H + gap) - gap
+    /** Top of each page in document space (pages can differ in height, e.g. PDF pages). */
+    private var tops = FloatArray(2)
+    private var topsFor = -1
+
+    private fun ensureTops() {
+        val n = doc.pages.size
+        if (topsFor == n && tops.size == n + 1) return
+        tops = FloatArray(n + 1)
+        var y = 0f
+        for (i in 0 until n) {
+            tops[i] = y
+            y += doc.pages[i].height + gap
+        }
+        tops[n] = y
+        topsFor = n
+    }
+
+    /** Call after pages are added or removed. */
+    private fun pagesChanged() {
+        topsFor = -1
+        ensureTops()
+    }
+
+    private fun pageTop(i: Int): Float { ensureTops(); return tops[i.coerceIn(0, doc.pages.size)] }
+    private fun pageH(i: Int) = doc.pages[i].height
+    private fun docHeight(): Float { ensureTops(); return tops[doc.pages.size] - gap }
+    private fun toneOf(i: Int) = PageRenderer.pageTone(doc, doc.pages[i])
     private fun toDocX(sx: Float) = (sx - tx) / scale
     private fun toDocY(sy: Float) = (sy - ty) / scale
     private fun toScreenX(dx: Float) = dx * scale + tx
     private fun toScreenY(dy: Float) = dy * scale + ty
-    private fun pageAt(docY: Float): Int =
-        floor(docY / (NoteDoc.PAGE_H + gap)).toInt().coerceIn(0, doc.pages.size - 1)
+    private fun pageAt(docY: Float): Int {
+        ensureTops()
+        var i = 0
+        while (i < doc.pages.size - 1 && docY >= tops[i + 1] - gap / 2f) i++
+        return i
+    }
 
     private fun updateMatrix() {
         viewMatrix.reset()
         viewMatrix.postScale(scale, scale)
         viewMatrix.postTranslate(tx, ty)
+        positionEditor()
     }
 
     private fun fitToWidth() {
@@ -170,6 +209,8 @@ class InkView(context: Context) : View(context) {
         if (!fitted) fitToWidth() else clampPan()
         ruler?.let { it.length = 2.4f * max(w, h) }
         sceneDirty()
+        if (isEditingText) post { keepCaretVisible() } // keyboard opened or closed
+
     }
 
     private fun sceneDirty() {
@@ -192,13 +233,16 @@ class InkView(context: Context) : View(context) {
         val bottom = toDocY(dirty?.bottom ?: height.toFloat())
         for (i in doc.pages.indices) {
             val pt = pageTop(i)
-            if (pt > bottom || pt + NoteDoc.PAGE_H < top) continue
+            val ph = pageH(i)
+            if (pt > bottom || pt + ph < top) continue
             c.save()
             c.translate(0f, pt)
             shadowPaint.color = 0x40000000
-            c.drawRect(-3f / scale, 3f / scale, NoteDoc.PAGE_W + 3f / scale, NoteDoc.PAGE_H + 6f / scale, shadowPaint)
-            val strokes = eraseOverride?.takeIf { it.page == i }?.working ?: doc.pages[i].strokes
-            PageRenderer.drawPage(c, doc, strokes, hidden.ifEmpty { null })
+            c.drawRect(-3f / scale, 3f / scale, NoteDoc.PAGE_W + 3f / scale, ph + 6f / scale, shadowPaint)
+            val page = doc.pages[i]
+            val strokes = eraseOverride?.takeIf { it.page == i }?.working ?: page.strokes
+            val bg = if (page.pdfPage >= 0) pdf?.get(page.pdfPage, NoteDoc.PAGE_W * scale, pdfReady) else null
+            PageRenderer.drawPage(c, doc, page, strokes, hidden.ifEmpty { null }, if (editPage == i) editOrig else null, bg)
             c.restore()
         }
         c.restore()
@@ -248,6 +292,7 @@ class InkView(context: Context) : View(context) {
         }
         drawLiveInk(canvas)
         drawSelection(canvas)
+        drawTextFrame(canvas)
         drawLasso(canvas)
         drawRuler(canvas)
         drawCursor(canvas)
@@ -255,7 +300,7 @@ class InkView(context: Context) : View(context) {
 
     // ---------------------------------------------------------------- input: classification
 
-    private enum class Act { NONE, INK, ERASE, LASSO, MOVE_SEL, SCALE_SEL, GESTURE, RULER }
+    private enum class Act { NONE, INK, ERASE, LASSO, MOVE_SEL, SCALE_SEL, GESTURE, RULER, TEXT_TAP, TEXT_HANDLE }
 
     private var act = Act.NONE
     private var activeId = -1
@@ -272,7 +317,7 @@ class InkView(context: Context) : View(context) {
                 val i = e.actionIndex
                 val isPen = isPenTool(e.getToolType(i))
                 when (act) {
-                    Act.INK, Act.ERASE, Act.LASSO, Act.MOVE_SEL, Act.SCALE_SEL -> {
+                    Act.INK, Act.ERASE, Act.LASSO, Act.MOVE_SEL, Act.SCALE_SEL, Act.TEXT_TAP, Act.TEXT_HANDLE -> {
                         // A finger arriving while a finger was inking means "this is a gesture": drop the stroke.
                         val activeIsPen = e.findPointerIndex(activeId).let { it >= 0 && isPenTool(e.getToolType(it)) }
                         if (!activeIsPen && !isPen) {
@@ -293,6 +338,11 @@ class InkView(context: Context) : View(context) {
                 Act.MOVE_SEL, Act.SCALE_SEL -> selMove(e)
                 Act.GESTURE -> gestureMove(e)
                 Act.RULER -> rulerMove(e)
+                Act.TEXT_TAP -> {
+                    val i = e.findPointerIndex(activeId)
+                    if (i >= 0 && hypot(e.getX(i) - tapX, e.getY(i) - tapY) > 14 * density) tapMoved = true
+                }
+                Act.TEXT_HANDLE -> handleMove(e)
                 Act.NONE -> {}
             }
             MotionEvent.ACTION_POINTER_UP -> {
@@ -331,6 +381,10 @@ class InkView(context: Context) : View(context) {
         val x = e.getX(i)
         val y = e.getY(i)
         activeId = e.getPointerId(i)
+        if (isEditingText) {
+            val h = handleAt(x, y)
+            if (h != Handle.NONE) { startHandleDrag(h, x, y); return }
+        }
         if (isPenTool(tool)) {
             lastPenTime = SystemClock.uptimeMillis()
             if (!stylusSeen) { stylusSeen = true; listener?.onStylusSeen() }
@@ -346,7 +400,7 @@ class InkView(context: Context) : View(context) {
             startRuler(e)
             return
         }
-        if (fingerDraws && e.pointerCount == 1) {
+        if (fingerDraws && e.pointerCount == 1 && mode != Mode.TEXT) {
             requestUnbufferedDispatch(e)
             startTool(e, i, x, y, false, pressure = 0.5f, eraserEnd = false)
         } else {
@@ -376,8 +430,13 @@ class InkView(context: Context) : View(context) {
             Mode.PEN -> startInk(x, y, pressure, tool, e.eventTime)
             Mode.ERASER -> startErase(x, y)
             Mode.LASSO -> startLasso(x, y)
+            Mode.TEXT -> { act = Act.TEXT_TAP; tapX = x; tapY = y; tapMoved = false }
         }
     }
+
+    private var tapX = 0f
+    private var tapY = 0f
+    private var tapMoved = false
 
     private fun finishCurrent(e: MotionEvent, i: Int) {
         when (act) {
@@ -385,6 +444,8 @@ class InkView(context: Context) : View(context) {
             Act.ERASE -> eraseUp()
             Act.LASSO -> lassoUp()
             Act.MOVE_SEL, Act.SCALE_SEL -> selUp()
+            Act.TEXT_TAP -> if (!tapMoved) textTap(tapX, tapY)
+            Act.TEXT_HANDLE -> { handleDrag = Handle.NONE; invalidate() }
             else -> {}
         }
         act = Act.NONE
@@ -396,6 +457,7 @@ class InkView(context: Context) : View(context) {
             Act.ERASE -> { eraseOverride = null; sceneDirty() }
             Act.LASSO -> { lassoN = 0; invalidate() }
             Act.MOVE_SEL, Act.SCALE_SEL -> { selDx = 0f; selDy = 0f; selScale = 1f; invalidate() }
+            Act.TEXT_HANDLE -> { editBox = hdBox ?: editBox; handleDrag = Handle.NONE; positionEditor(); invalidate() }
             else -> {}
         }
         act = Act.NONE
@@ -525,7 +587,7 @@ class InkView(context: Context) : View(context) {
     private fun flushLive() {
         val s = inking ?: return
         val c = liveCanvas ?: return
-        val color = PageRenderer.displayColor(s.color, doc.tone) or 0xFF000000.toInt()
+        val color = PageRenderer.displayColor(s.color, toneOf(inkPage)) or 0xFF000000.toInt()
         if (s.tool == Stroke.HIGHLIGHTER) {
             // The highlighter is a fat round line; redraw its centre line in full (cheap).
             live?.eraseColor(Color.TRANSPARENT)
@@ -546,9 +608,9 @@ class InkView(context: Context) : View(context) {
     private fun drawLiveInk(canvas: Canvas) {
         val s = inking ?: return
         val bmp = live ?: return
-        val color = PageRenderer.displayColor(s.color, doc.tone)
+        val color = PageRenderer.displayColor(s.color, toneOf(inkPage))
         livePaint.alpha = (255 * PageRenderer.toolAlpha(s.tool)).toInt()
-        livePaint.blendMode = if (s.tool == Stroke.HIGHLIGHTER && doc.tone != NoteDoc.TONE_DARK) BlendMode.MULTIPLY else null
+        livePaint.blendMode = if (s.tool == Stroke.HIGHLIGHTER && toneOf(inkPage) != NoteDoc.TONE_DARK) BlendMode.MULTIPLY else null
         canvas.drawBitmap(bmp, 0f, 0f, livePaint)
         if (s.tool == Stroke.HIGHLIGHTER || s.n == 0 || straightened) return
         // Tail: from the last finished point to the pen, plus a short prediction so ink keeps up with the nib.
@@ -589,12 +651,13 @@ class InkView(context: Context) : View(context) {
             c.save()
             c.concat(viewMatrix)
             c.translate(0f, pageTop(inkPage))
-            c.clipRect(0f, 0f, NoteDoc.PAGE_W, NoteDoc.PAGE_H)
-            PageRenderer.drawStroke(c, s, doc.tone)
+            c.clipRect(0f, 0f, NoteDoc.PAGE_W, pageH(inkPage))
+            PageRenderer.drawStroke(c, s, toneOf(inkPage))
             c.restore()
         } else sceneDirty()
         if (inkPage == doc.pages.size - 1) {
             doc.pages.add(NoteDoc.Page()) // keep a fresh page ready below
+            pagesChanged()
             clampPan()
             sceneDirty()
             notifyPage()
@@ -848,7 +911,7 @@ class InkView(context: Context) : View(context) {
         c.concat(viewMatrix)
         c.translate(selDx, selDy + pageTop(sel.page))
         if (selScale != 1f) c.scale(selScale, selScale, b[0], b[1])
-        for (s in sel.strokes) PageRenderer.drawStroke(c, s, doc.tone)
+        for (s in sel.strokes) PageRenderer.drawStroke(c, s, toneOf(sel.page))
         c.restore()
         val r = selScreenBounds()
         c.drawRect(r, selBox)
@@ -948,6 +1011,8 @@ class InkView(context: Context) : View(context) {
 
     private fun endGesture(e: MotionEvent?) {
         val quick = e != null && e.eventTime - gStartTime < 260 && gTravel < 24 * density
+        val tap = e != null && e.eventTime - gStartTime < 450 && gTravel < 16 * density
+        if (tap && gMaxPointers == 1 && mode == Mode.TEXT && e != null) { textTap(e.x, e.y); velocity?.recycle(); velocity = null; return }
         if (quick && gMaxPointers == 2) { undo(); return }
         if (quick && gMaxPointers == 3) { redo(); return }
         val v = velocity
@@ -1156,7 +1221,7 @@ class InkView(context: Context) : View(context) {
         }
         val tool = if (hoverButton && sideButton == SideAction.HIGHLIGHTER) Stroke.HIGHLIGHTER else penTool
         val r = max(2f * density, (if (tool == Stroke.HIGHLIGHTER) widths[tool] / 2f else Outline.halfWidth(tool, widths[tool], 0.6f, 0.0)) * scale)
-        cursorFill.color = PageRenderer.displayColor(colors[tool], doc.tone)
+        cursorFill.color = PageRenderer.displayColor(colors[tool], toneOf(pageAt(toDocY(y))))
         cursorFill.alpha = if (tool == Stroke.HIGHLIGHTER) 110 else 200
         c.drawCircle(x, y, r, cursorFill)
         cursorPaint.color = 0x99FFFFFF.toInt()
@@ -1187,17 +1252,21 @@ class InkView(context: Context) : View(context) {
     // ---------------------------------------------------------------- public actions
 
     fun undo() {
+        commitText()
         clearSelection()
         if (history.undo() >= 0) { changed(); sceneDirty() }
     }
 
     fun redo() {
+        commitText()
         clearSelection()
         if (history.redo() >= 0) { changed(); sceneDirty() }
     }
 
     fun addPage() {
+        commitText()
         doc.pages.add(NoteDoc.Page())
+        pagesChanged()
         clampPan()
         scrollToPage(doc.pages.size - 1)
         changed()
@@ -1205,11 +1274,14 @@ class InkView(context: Context) : View(context) {
 
     /** Deletes the page in view. Page structure changes can't be undone, so history resets. */
     fun deleteCurrentPage() {
+        commitText()
         if (doc.pages.size <= 1) {
             doc.pages[0].strokes.clear()
+            doc.pages[0].texts.clear()
         } else {
             doc.pages.removeAt(currentPage())
         }
+        pagesChanged()
         history.clear()
         clearSelection()
         clampPan()
@@ -1220,10 +1292,11 @@ class InkView(context: Context) : View(context) {
     }
 
     fun clearCurrentPage() {
+        commitText()
         val p = currentPage()
         val n = doc.pages[p].strokes.size
-        if (n == 0) return
-        history.apply(p, (0 until n).toList(), null)
+        if (n == 0 && doc.pages[p].texts.isEmpty()) return
+        history.apply(p, (0 until n).toList(), null, emptyList())
         changed()
         sceneDirty()
     }
@@ -1265,6 +1338,379 @@ class InkView(context: Context) : View(context) {
             lastTotalNotified = doc.pages.size
             listener?.onPageChanged(c, doc.pages.size)
         }
+    }
+
+    // ---------------------------------------------------------------- attached PDF
+
+    /** Renders the attached PDF's pages underneath; set by the editor for notes made from a PDF. */
+    var pdf: com.ski.notes.data.PdfPages? = null
+        set(v) { field = v; sceneDirty() }
+    private val pdfReady: () -> Unit = { sceneDirty() }
+
+    // ---------------------------------------------------------------- typed text
+
+    /** The on-screen text field used for typing; supplied by [NoteCanvasLayout]. */
+    var textEditor: android.widget.EditText? = null
+        set(v) {
+            field = v
+            v?.addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun afterTextChanged(s: android.text.Editable?) {
+                    if (editPage >= 0) {
+                        invalidate() // frame follows the text's height
+                        post { keepCaretVisible() }
+                    }
+                }
+            })
+        }
+
+    /** Style for new text boxes, set by the formatting bar. */
+    var textSize = 36f
+    var textColor = Color.BLACK
+
+    private var editPage = -1
+    private var editOrig: TextBox? = null // the box being edited as it was before (null = brand new)
+    private var editBox: TextBox? = null  // geometry and base style while editing
+    private var editorWidth = -1
+
+    val isEditingText: Boolean get() = editPage >= 0
+
+    private fun boxHeight(page: Int, t: TextBox) = TextStyler.height(t, toneOf(page))
+
+    /** Text box under a page-space point, or null. */
+    private fun textAt(page: Int, px: Float, py: Float): TextBox? {
+        val pad = 10f / scale
+        return doc.pages[page].texts.lastOrNull { t ->
+            px >= t.x - pad && px <= t.x + t.w + pad && py >= t.y - pad && py <= t.y + max(boxHeight(page, t), t.size * 1.2f) + pad
+        }
+    }
+
+    /** A tap with the Text tool: edit the box there, or start a new one. */
+    private fun textTap(sx: Float, sy: Float) {
+        val wasEditing = isEditingText
+        val page = pageAt(toDocY(sy))
+        val px = toDocX(sx)
+        val py = toDocY(sy) - pageTop(page)
+        if (px < 0 || px > NoteDoc.PAGE_W || py < 0 || py > pageH(page)) { commitText(); return }
+        val hit = textAt(page, px, py)
+        if (hit != null && hit === editOrig) return
+        commitText()
+        if (hit != null) {
+            beginTextEdit(page, hit, hit, py, px)
+            return
+        }
+        if (wasEditing) return // first tap away just finishes typing
+        val x = px.coerceIn(30f, NoteDoc.PAGE_W - 240f)
+        val w = (NoteDoc.PAGE_W - 60f - x).coerceAtLeast(220f)
+        val y = (py - textSize * 0.7f).coerceIn(0f, pageH(page) - textSize)
+        beginTextEdit(page, null, TextBox(x, y, w, textSize, textColor, "", null), -1f, -1f)
+    }
+
+    private fun beginTextEdit(page: Int, orig: TextBox?, box: TextBox, tapY: Float, tapX: Float) {
+        val ed = textEditor ?: return
+        editPage = page
+        editOrig = orig
+        editBox = box
+        val tone = toneOf(page)
+        ed.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, box.size)
+        ed.setTextColor(PageRenderer.displayColor(box.color, tone))
+        ed.setText(TextStyler.spannable(box, tone))
+        editorWidth = -1
+        positionEditor()
+        ed.visibility = VISIBLE
+        ed.requestFocus()
+        // Put the cursor where the box was tapped.
+        var cursor = ed.text.length
+        if (orig != null && tapY >= 0) {
+            val l = TextStyler.layout(orig, tone)
+            val line = l.getLineForVertical((tapY - orig.y).toInt())
+            cursor = l.getOffsetForHorizontal(line, tapX - orig.x).coerceIn(0, ed.text.length)
+        }
+        ed.setSelection(cursor)
+        ed.post {
+            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+            imm.showSoftInput(ed, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+        }
+        sceneDirty()
+        listener?.onTextEditing(true)
+    }
+
+    /** Lines the text field up with the box on the page, at the current zoom. */
+    private fun positionEditor() {
+        val ed = textEditor ?: return
+        val box = editBox ?: return
+        if (editPage < 0) return
+        val w = box.w.toInt()
+        if (w != editorWidth) {
+            editorWidth = w
+            ed.layoutParams = ed.layoutParams.apply { width = w }
+        }
+        ed.pivotX = 0f
+        ed.pivotY = 0f
+        ed.scaleX = scale
+        ed.scaleY = scale
+        ed.translationX = toScreenX(box.x)
+        ed.translationY = toScreenY(pageTop(editPage) + box.y)
+    }
+
+    /** Finishes typing: saves the box (an empty box is removed) as one undo step. */
+    fun commitText() {
+        val ed = textEditor ?: return
+        if (editPage < 0) return
+        val page = editPage
+        val box = editBox!!
+        val tone = toneOf(page)
+        val text = ed.text
+        val content = text.toString()
+        val runs = TextStyler.runsOf(text, tone, box.color)
+        val nb = box.withContent(content, runs)
+        val list = ArrayList(doc.pages[page].texts)
+        val orig = editOrig
+        val idx = if (orig == null) -1 else list.indexOfFirst { it === orig }
+        when {
+            nb.isBlank() -> if (idx >= 0) list.removeAt(idx)
+            idx >= 0 -> if (!nb.sameAs(orig)) list[idx] = nb
+            else -> list.add(nb)
+        }
+        endTextEdit()
+        if (list != doc.pages[page].texts) {
+            history.setTexts(page, list)
+            changed()
+        }
+        sceneDirty()
+    }
+
+    /** Drops the edit without saving (used when the whole document changes). */
+    fun cancelTextEdit() {
+        if (editPage < 0) return
+        endTextEdit()
+        sceneDirty()
+    }
+
+    private fun endTextEdit() {
+        val ed = textEditor
+        editPage = -1
+        editOrig = null
+        editBox = null
+        if (ed != null) {
+            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+            imm.hideSoftInputFromWindow(ed.windowToken, 0)
+            ed.clearFocus()
+            ed.visibility = GONE
+            ed.setText("")
+        }
+        listener?.onTextEditing(false)
+    }
+
+    /** Deletes the box being edited. */
+    fun deleteEditingText() {
+        val ed = textEditor ?: return
+        if (editPage < 0) return
+        ed.setText("")
+        commitText()
+    }
+
+    private fun currentSelection(): Pair<Int, Int> {
+        val ed = textEditor ?: return 0 to 0
+        val a = min(ed.selectionStart, ed.selectionEnd).coerceAtLeast(0)
+        val b = max(ed.selectionStart, ed.selectionEnd).coerceAtLeast(0)
+        // No selection: apply to the word at the cursor, or the whole box if the cursor isn't in a word.
+        if (a != b) return a to b
+        val t = ed.text
+        var ws = a
+        var we = a
+        while (ws > 0 && Character.isLetterOrDigit(t[ws - 1])) ws--
+        while (we < t.length && Character.isLetterOrDigit(t[we])) we++
+        return if (ws < we) ws to we else 0 to t.length
+    }
+
+    private fun applyRuns(runs: Array<TextBox.Run>) {
+        val ed = textEditor ?: return
+        val box = editBox ?: return
+        val selA = ed.selectionStart
+        val selB = ed.selectionEnd
+        ed.setText(TextStyler.spannable(ed.text.toString(), runs, toneOf(editPage)))
+        ed.setSelection(selA.coerceIn(0, ed.text.length), selB.coerceIn(0, ed.text.length))
+        editBox = box
+        changedWhileEditing()
+    }
+
+    /** Bold / italic / underline / strikethrough on the selection (or word at the cursor). */
+    fun toggleTextFlag(flag: Int) {
+        val ed = textEditor ?: return
+        val box = editBox ?: return
+        if (editPage < 0) return
+        val (a, b) = currentSelection()
+        if (a >= b) return
+        val tone = toneOf(editPage)
+        val turnOff = TextStyler.allHave(ed.text, tone, box.color, a, b, flag)
+        applyRuns(TextStyler.restyle(ed.text, tone, box.color, a, b) {
+            it.copy(flags = if (turnOff) it.flags and flag.inv() else it.flags or flag)
+        })
+    }
+
+    /** Colour for the selection; with nothing selected, the whole box. Also becomes the colour for new boxes. */
+    fun setTextColorForEdit(color: Int) {
+        textColor = color
+        val ed = textEditor ?: return
+        val box = editBox ?: return
+        if (editPage < 0) return
+        val tone = toneOf(editPage)
+        if (ed.selectionStart == ed.selectionEnd) {
+            // Whole box: base colour, clearing per-run colours.
+            val runs = TextStyler.restyle(ed.text, tone, box.color, 0, ed.text.length) { it.copy(color = 0) }
+            editBox = box.withStyle(box.size, color)
+            ed.setTextColor(PageRenderer.displayColor(color, tone))
+            applyRuns(runs)
+            editBox = box.withStyle(box.size, color)
+        } else {
+            val (a, b) = currentSelection()
+            applyRuns(TextStyler.restyle(ed.text, tone, box.color, a, b) { it.copy(color = if (color == box.color) 0 else color) })
+        }
+    }
+
+    /** Size for the selection; with nothing selected, the whole box. Also the size for new boxes. */
+    fun setTextSizeForEdit(size: Float) {
+        textSize = size
+        val ed = textEditor ?: return
+        val box = editBox ?: return
+        if (editPage < 0) return
+        val tone = toneOf(editPage)
+        if (ed.selectionStart == ed.selectionEnd) {
+            editBox = box.withStyle(size, box.color)
+            ed.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, size)
+            applyRuns(TextStyler.restyle(ed.text, tone, box.color, 0, ed.text.length) { it.copy(scale = 1f) })
+            editBox = box.withStyle(size, box.color)
+        } else {
+            val (a, b) = currentSelection()
+            applyRuns(TextStyler.restyle(ed.text, tone, box.color, a, b) { it.copy(scale = size / box.size) })
+        }
+    }
+
+    /** Adds or removes "• " at the start of each selected line. */
+    fun toggleBullets() {
+        val ed = textEditor ?: return
+        if (editPage < 0) return
+        val t = ed.text
+        val a = min(ed.selectionStart, ed.selectionEnd).coerceAtLeast(0)
+        val b = max(ed.selectionStart, ed.selectionEnd).coerceAtLeast(0)
+        val starts = ArrayList<Int>()
+        var ls = a
+        while (ls > 0 && t[ls - 1] != '\n') ls--
+        starts.add(ls)
+        for (i in ls until b) if (t[i] == '\n' && i + 1 <= t.length) starts.add(i + 1)
+        val allBulleted = starts.all { t.startsWith("• ", it) }
+        for (st in starts.reversed()) {
+            if (allBulleted) t.delete(st, st + 2) else if (!t.startsWith("• ", st)) t.insert(st, "• ")
+        }
+        changedWhileEditing()
+    }
+
+    private fun changedWhileEditing() {
+        positionEditor()
+        invalidate()
+    }
+
+    /** Scrolls so the line being typed stays above the keyboard. */
+    fun keepCaretVisible() {
+        val ed = textEditor ?: return
+        val box = editBox ?: return
+        if (editPage < 0 || height == 0) return
+        val l = ed.layout ?: return
+        val line = l.getLineForOffset(ed.selectionEnd.coerceAtLeast(0))
+        val top = toScreenY(pageTop(editPage) + box.y + l.getLineTop(line))
+        val bottom = toScreenY(pageTop(editPage) + box.y + l.getLineBottom(line))
+        val margin = 24 * density
+        val shift = when {
+            bottom > height - margin -> (height - margin) - bottom
+            top < margin -> margin - top
+            else -> 0f
+        }
+        if (shift != 0f) {
+            ty += shift
+            clampPan()
+            viewportChanged()
+        }
+    }
+
+    // Move / resize handles around the box being edited.
+    private enum class Handle { NONE, MOVE, WIDTH }
+    private var handleDrag = Handle.NONE
+    private var hdX = 0f
+    private var hdY = 0f
+    private var hdBox: TextBox? = null
+
+    private fun editScreenRect(): RectF? {
+        val box = editBox ?: return null
+        val ed = textEditor ?: return null
+        val top = toScreenY(pageTop(editPage) + box.y)
+        val h = max(ed.height.toFloat(), box.size * 1.2f) * scale
+        return RectF(toScreenX(box.x), top, toScreenX(box.x + box.w), top + h)
+    }
+
+    private fun handleAt(x: Float, y: Float): Handle {
+        val r = editScreenRect() ?: return Handle.NONE
+        val hr = 22 * density
+        if (hypot(x - (r.left + 18 * density), y - (r.top - 18 * density)) < hr) return Handle.MOVE
+        if (hypot(x - (r.right + 14 * density), y - r.centerY()) < hr) return Handle.WIDTH
+        return Handle.NONE
+    }
+
+    private fun startHandleDrag(h: Handle, x: Float, y: Float) {
+        handleDrag = h
+        hdX = x
+        hdY = y
+        hdBox = editBox
+        act = Act.TEXT_HANDLE
+    }
+
+    private fun handleMove(e: MotionEvent) {
+        val i = e.findPointerIndex(activeId)
+        if (i < 0) return
+        val b = hdBox ?: return
+        val dx = (e.getX(i) - hdX) / scale
+        val dy = (e.getY(i) - hdY) / scale
+        editBox = when (handleDrag) {
+            Handle.MOVE -> b.moved(
+                (b.x + dx).coerceIn(-b.w + 60f, NoteDoc.PAGE_W - 60f),
+                (b.y + dy).coerceIn(0f, pageH(editPage) - 20f),
+            )
+            Handle.WIDTH -> b.withWidth((b.w + dx).coerceIn(120f, NoteDoc.PAGE_W * 1.5f))
+            Handle.NONE -> b
+        }
+        positionEditor()
+        invalidate()
+    }
+
+    private val framePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 1.5f * resources.displayMetrics.density
+        color = 0xFF4F7CFF.toInt()
+        pathEffect = DashPathEffect(floatArrayOf(10f, 8f), 0f)
+    }
+    private val gripPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF4F7CFF.toInt() }
+    private val gripIcon = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        strokeWidth = 2f * resources.displayMetrics.density
+        strokeCap = Paint.Cap.ROUND
+    }
+
+    private fun drawTextFrame(c: Canvas) {
+        val r = editScreenRect() ?: return
+        val pad = 4 * density
+        c.drawRect(r.left - pad, r.top - pad, r.right + pad, r.bottom + pad, framePaint)
+        // move grip (four-way arrows suggested by a cross)
+        val mx = r.left + 18 * density
+        val my = r.top - 18 * density
+        c.drawCircle(mx, my, 14 * density, gripPaint)
+        val a = 6 * density
+        c.drawLine(mx - a, my, mx + a, my, gripIcon)
+        c.drawLine(mx, my - a, mx, my + a, gripIcon)
+        // width knob
+        val wx = r.right + 14 * density
+        val wy = r.centerY()
+        c.drawRoundRect(wx - 6 * density, wy - 16 * density, wx + 6 * density, wy + 16 * density, 6 * density, 6 * density, gripPaint)
     }
 
     override fun onDetachedFromWindow() {

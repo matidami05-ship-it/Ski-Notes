@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 108dp canvas, content inside the 66dp safe zone (21..87): a page with ruled ink and a pen. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#FFF4F6FA"
+        android:pathData="M32,24 h36 a5,5 0 0 1 5,5 v50 a5,5 0 0 1 -5,5 h-36 a5,5 0 0 1 -5,-5 v-50 a5,5 0 0 1 5,-5 z" />
+    <path android:strokeColor="#FFC9D2E3" android:strokeWidth="1.6"
+        android:pathData="M33,40 h34 M33,50 h34 M33,60 h34 M33,70 h34" />
+    <path android:strokeColor="#FF4F7CFF" android:strokeWidth="3.2" android:strokeLineCap="round"
+        android:pathData="M36,47 q5,-7 9,0 t9,0 t8,-1" />
+    <path android:strokeColor="#FF1C2230" android:strokeWidth="2.6" android:strokeLineCap="round"
+        android:pathData="M36,57 h20" />
+    <path android:fillColor="#FF2B3140"
+        android:pathData="M80,26 l6,6 l-26,26 l-8,2 l2,-8 z" />
+    <path android:fillColor="#FFFFB547"
+        android:pathData="M80,26 l6,6 l-3,3 l-6,-6 z" />
+</vector>

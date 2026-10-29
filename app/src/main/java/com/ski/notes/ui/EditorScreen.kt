@@ -293,7 +293,7 @@ fun EditorScreen(id: String, isNew: Boolean, repo: NoteRepository, prefs: Prefs,
                 }
 
                 // selection actions
-                AnimatedVisibility(selCount > 0, enter = fadeIn(), exit = fadeOut(), modifier = Modifier.align(Alignment.TopCenter).padding(top = 10.dp)) {
+                androidx.compose.animation.AnimatedVisibility(selCount > 0, enter = fadeIn(), exit = fadeOut(), modifier = Modifier.align(Alignment.TopCenter).padding(top = 10.dp)) {
                     Surface(color = PanelHigh, shape = RoundedCornerShape(24.dp), shadowElevation = 6.dp) {
                         Row(Modifier.padding(horizontal = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                             Text("$selCount selected", fontSize = 13.sp, modifier = Modifier.padding(horizontal = 10.dp))
@@ -321,7 +321,7 @@ fun EditorScreen(id: String, isNew: Boolean, repo: NoteRepository, prefs: Prefs,
                 }
 
                 // tool options popover
-                AnimatedVisibility(showOptions, enter = fadeIn(), exit = fadeOut(), modifier = Modifier.align(Alignment.BottomCenter).padding(10.dp)) {
+                androidx.compose.animation.AnimatedVisibility(showOptions, enter = fadeIn(), exit = fadeOut(), modifier = Modifier.align(Alignment.BottomCenter).padding(10.dp)) {
                     Surface(color = PanelHigh, shape = RoundedCornerShape(18.dp), shadowElevation = 8.dp, modifier = Modifier.widthIn(max = 460.dp)) {
                         Column(Modifier.padding(16.dp)) {
                             when (mode) {
